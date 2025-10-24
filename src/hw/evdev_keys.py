@@ -11,7 +11,7 @@ except Exception:  # pragma: no cover
 
 
 class EvdevConfirm:
-    """Listen for KEY_POWER from gpio-keys (gpio-shutdown overlay) as confirm.
+    """Listen for KEY_POWER from any input device (e.g., gpio-shutdown) as confirm.
 
     Non-fatal if evdev is unavailable or device not found.
     """
@@ -46,14 +46,19 @@ class EvdevConfirm:
     def _find_device_path(self) -> Optional[str]:
         try:
             for path in list_devices():
-                dev = InputDevice(path)
-                name = (dev.name or "").lower()
-                if "gpio" in name and "key" in name:
+                try:
+                    dev = InputDevice(path)
                     caps = dev.capabilities().get(ecodes.EV_KEY, [])
                     if ecodes.KEY_POWER in caps:
                         dev.close()
                         return path
-                dev.close()
+                    dev.close()
+                except Exception:
+                    try:
+                        dev.close()  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                    continue
         except Exception:
             return None
         return None
