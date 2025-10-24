@@ -20,11 +20,32 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        return float(v) if v is not None and v != "" else default
+    except Exception:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
 BACK_GPIO = _env_int("BESSAM_BACK_GPIO", 17)
 CONFIRM_GPIO = _env_int("BESSAM_CONFIRM_GPIO", 5)
 PUSH_GPIO = _env_int("BESSAM_PUSH_GPIO", 10)
 ENC_A_GPIO = _env_int("BESSAM_ENC_A_GPIO", 22)
 ENC_B_GPIO = _env_int("BESSAM_ENC_B_GPIO", 27)
+ENC_TICKS_PER_DETENT = _env_int("BESSAM_ENC_TICKS_PER_DETENT", 4)
+POLL_INTERVAL_SEC = _env_float("BESSAM_POLL_INTERVAL_SEC", 0.005)
+DEBOUNCE_SEC = _env_float("BESSAM_DEBOUNCE_SEC", 0.03)
+PULL_UP = _env_bool("BESSAM_PULL_UP", True)
+ENC_REVERSE = _env_bool("BESSAM_ENC_REVERSE", False)
+DEBUG = _env_bool("BESSAM_DEBUG", False)
 
 
 class BackgroundWorker:
@@ -54,9 +75,8 @@ class App:
         self.display = OledDisplay()
         self.docker = DockerManager()
         self.worker = BackgroundWorker(self.events)
-        self.inputs = Inputs(BACK_GPIO, CONFIRM_GPIO, PUSH_GPIO, pull_up=True)
-        self.encoder = EncoderPoller(ENC_A_GPIO, ENC_B_GPIO, pull_up=True, ticks_per_detent=2)
-        self._last_steps = 0
+        self.inputs = Inputs(BACK_GPIO, CONFIRM_GPIO, PUSH_GPIO, pull_up=PULL_UP)
+        self.encoder = EncoderPoller(ENC_A_GPIO, ENC_B_GPIO, pull_up=PULL_UP, ticks_per_detent=ENC_TICKS_PER_DETENT)
         # State
         self.mode: str = "menu"
         self.spinner_frame = 0
@@ -65,13 +85,21 @@ class App:
         self.current_index = 0
         self.current_container_id: Optional[str] = None
         self.game: Optional[SnakeGame] = None
-        # Button polling state
+        # Button debouncing
         self._btn_state = {"back": False, "confirm": False, "push": False}
+        self._btn_last_change = {"back": 0.0, "confirm": 0.0, "push": 0.0}
+        # Diagnostics
+        self._input_test_enc_total = 0
+        self._input_test_last_draw = 0.0
         # Init UI
         self._init_menus()
         self.display.draw_text("Pi Control\nSystem v2.0\n\nInitializing...")
         time.sleep(1.0)
         self._show_menu()
+
+    def _debug(self, msg: str) -> None:
+        if DEBUG:
+            print(msg, flush=True)
 
     def _init_menus(self) -> None:
         def push_menu(title: str, items: List[tuple[str, Callable[[], None]]]) -> None:
@@ -130,6 +158,12 @@ class App:
             ]
             self.push_menu("Games", items)
 
+        def input_test() -> None:
+            self.mode = "input_test"
+            self._input_test_enc_total = 0
+            self._input_test_last_draw = 0.0
+            self._render_input_test(force=True)
+
         items: List[tuple[str, Callable[[], None]]] = [
             ("Docker", docker_menu),
             ("System Info", show_info),
@@ -139,6 +173,7 @@ class App:
             ("Memory Info", show_mem),
             ("Update System", do_update),
             ("Games", games_menu),
+            ("Input Test", input_test),
             ("Restart Pi", do_reboot),
             ("Shutdown", do_shutdown),
             ("Exit", exit_app),
@@ -201,7 +236,20 @@ class App:
         self.game.render(image, draw)
         self.display.show_image(image)
 
+    def _render_input_test(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._input_test_last_draw < 0.1:
+            return
+        self._input_test_last_draw = now
+        states = self.inputs.read_states()
+        back = "1" if states.get("back") else "0"
+        confirm = "1" if states.get("confirm") else "0"
+        push = "1" if states.get("push") else "0"
+        text = f"Back:{back} Conf:{confirm}\nPush:{push} Enc:{self._input_test_enc_total}"
+        self.display.draw_text(text)
+
     def _handle_button(self, name: str) -> None:
+        self._debug(f"button:{name}")
         if self.mode == "menu":
             if name == "confirm" and self.current_menu_items:
                 _, action = self.current_menu_items[self.current_index]
@@ -212,6 +260,9 @@ class App:
             if name == "confirm" and hasattr(self, "_docker_list") and self._docker_list:
                 self._open_container_actions(self.current_index)
             elif name == "back":
+                self._show_menu()
+        elif self.mode == "input_test":
+            if name == "back":
                 self._show_menu()
         elif self.mode == "game_snake":
             if not self.game:
@@ -225,6 +276,9 @@ class App:
             pass
 
     def _handle_rotate(self, delta: int) -> None:
+        if ENC_REVERSE:
+            delta = -delta
+        self._debug(f"enc:{delta}")
         if self.mode in ("menu", "docker_list"):
             items_len = len(self.current_menu_items) if self.mode == "menu" else len(getattr(self, "_docker_list", [])) or 1
             if delta > 0:
@@ -236,17 +290,31 @@ class App:
                 self.display.draw_menu(labels, self.current_index)
             else:
                 self._refresh_docker_list()
+        elif self.mode == "input_test":
+            self._input_test_enc_total += delta
+            self._render_input_test(force=True)
         elif self.mode == "game_snake" and self.game:
             self.game.change_direction_clockwise(clockwise=(delta > 0))
             self._render_game()
 
     def _poll_buttons(self) -> None:
         states = self.inputs.read_states()
-        back = states.get("back", False)
-        confirm = states.get("confirm", False)
-        push = states.get("push", False)
+        # Treat push as confirm
+        states["confirm"] = states.get("confirm", False) or states.get("push", False)
         now = time.monotonic()
-        if back and confirm:
+        for name in ("back", "confirm"):
+            pressed = states.get(name, False)
+            last_pressed = self._btn_state[name]
+            if pressed != last_pressed:
+                last_change = self._btn_last_change[name]
+                if now - last_change >= DEBOUNCE_SEC:
+                    self._btn_last_change[name] = now
+                    self._btn_state[name] = pressed
+                    if pressed:
+                        # rising edge only
+                        self._handle_button(name)
+        # Exit on hold Back+Confirm
+        if self._btn_state["back"] and self._btn_state["confirm"]:
             hold = getattr(self, "_hold_start", None)
             if hold is None:
                 self._hold_start = now
@@ -257,15 +325,6 @@ class App:
                 raise SystemExit(0)
         else:
             self._hold_start = None  # type: ignore[assignment]
-        if back and not self._btn_state["back"]:
-            self._handle_button("back")
-        if confirm and not self._btn_state["confirm"]:
-            self._handle_button("confirm")
-        if push and not self._btn_state["push"]:
-            self._handle_button("push")
-        self._btn_state["back"] = back
-        self._btn_state["confirm"] = confirm
-        self._btn_state["push"] = push
 
     def _handle_tick(self) -> None:
         delta = self.encoder.read_delta()
@@ -278,28 +337,28 @@ class App:
         elif self.mode == "game_snake" and self.game:
             self.game.update()
             self._render_game()
+        elif self.mode == "input_test":
+            self._render_input_test()
 
     def run(self) -> None:
         while True:
             try:
-                try:
-                    event = self.events.get(timeout=0.05)
-                except Exception:
-                    event = Tick(type="tick")
-                if isinstance(event, ButtonEvent):
-                    self._handle_button(event.name)
-                elif isinstance(event, Rotate):
-                    self._handle_rotate(event.delta)
-                elif isinstance(event, TaskDone):
-                    msg = event.message or ("Done" if event.ok else "Failed")
-                    self.display.draw_text(msg)
-                    time.sleep(1.0)
-                    if self.mode == "docker_list":
-                        self._refresh_docker_list()
-                    else:
-                        self._show_menu()
-                else:
-                    self._handle_tick()
+                time.sleep(POLL_INTERVAL_SEC)
+                self._handle_tick()
+                while not self.events.empty():
+                    event = self.events.get_nowait()
+                    if isinstance(event, ButtonEvent):
+                        self._handle_button(event.name)
+                    elif isinstance(event, Rotate):
+                        self._handle_rotate(event.delta)
+                    elif isinstance(event, TaskDone):
+                        msg = event.message or ("Done" if event.ok else "Failed")
+                        self.display.draw_text(msg)
+                        time.sleep(1.0)
+                        if self.mode == "docker_list":
+                            self._refresh_docker_list()
+                        else:
+                            self._show_menu()
             except KeyboardInterrupt:
                 break
             except SystemExit:

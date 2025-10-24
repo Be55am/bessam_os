@@ -39,7 +39,7 @@ class Inputs:
 class EncoderPoller:
     """Simple quadrature encoder poller.
 
-    Accumulates transitions and emits +/-1 per detent (approx 2 ticks by default).
+    Accumulates transitions and emits +/-1 per detent.
     """
 
     _TRANSITIONS: Dict[Tuple[int, int], int] = {
@@ -53,7 +53,7 @@ class EncoderPoller:
         (1, 0): -1,
     }
 
-    def __init__(self, a_gpio: int, b_gpio: int, pull_up: bool = True, ticks_per_detent: int = 2) -> None:
+    def __init__(self, a_gpio: int, b_gpio: int, pull_up: bool = True, ticks_per_detent: int = 4) -> None:
         self._a = a_gpio
         self._b = b_gpio
         self._pull_up = pull_up
@@ -70,10 +70,8 @@ class EncoderPoller:
         self._accumulator = 0
 
     def _read_state(self) -> int:
-        a = GPIO.input(self._a)
-        b = GPIO.input(self._b)
-        a_bit = 0 if (a == GPIO.LOW and self._pull_up) else (1 if (a == GPIO.HIGH and self._pull_up) else a)
-        b_bit = 0 if (b == GPIO.LOW and self._pull_up) else (1 if (b == GPIO.HIGH and self._pull_up) else b)
+        a_bit = 1 if GPIO.input(self._a) else 0
+        b_bit = 1 if GPIO.input(self._b) else 0
         return (a_bit << 1) | b_bit
 
     def read_delta(self) -> int:
