@@ -46,6 +46,10 @@ DEBOUNCE_SEC = _env_float("BESSAM_DEBOUNCE_SEC", 0.03)
 PULL_UP = _env_bool("BESSAM_PULL_UP", True)
 ENC_REVERSE = _env_bool("BESSAM_ENC_REVERSE", False)
 DEBUG = _env_bool("BESSAM_DEBUG", False)
+USE_PUSH_AS_CONFIRM = _env_bool("BESSAM_USE_PUSH_AS_CONFIRM", True)
+BACK_INVERT = _env_bool("BESSAM_BACK_INVERT", False)
+CONFIRM_INVERT = _env_bool("BESSAM_CONFIRM_INVERT", False)
+PUSH_INVERT = _env_bool("BESSAM_PUSH_INVERT", False)
 
 
 class BackgroundWorker:
@@ -241,11 +245,21 @@ class App:
         if not force and now - self._input_test_last_draw < 0.1:
             return
         self._input_test_last_draw = now
-        states = self.inputs.read_states()
-        back = "1" if states.get("back") else "0"
-        confirm = "1" if states.get("confirm") else "0"
-        push = "1" if states.get("push") else "0"
-        text = f"Back:{back} Conf:{confirm}\nPush:{push} Enc:{self._input_test_enc_total}"
+        raw = self.inputs.read_states()
+        # Apply invert flags for display
+        back = raw.get("back", False)
+        conf = raw.get("confirm", False)
+        push = raw.get("push", False)
+        if BACK_INVERT:
+            back = not back
+        if CONFIRM_INVERT:
+            conf = not conf
+        if PUSH_INVERT:
+            push = not push
+        text = (
+            f"Back:{'1' if back else '0'} Conf:{'1' if conf else '0'}\n"
+            f"Push:{'1' if push else '0'} Enc:{self._input_test_enc_total}"
+        )
         self.display.draw_text(text)
 
     def _handle_button(self, name: str) -> None:
@@ -298,12 +312,24 @@ class App:
             self._render_game()
 
     def _poll_buttons(self) -> None:
-        states = self.inputs.read_states()
-        # Treat push as confirm
-        states["confirm"] = states.get("confirm", False) or states.get("push", False)
+        raw_states = self.inputs.read_states()
+        if DEBUG:
+            self._debug(f"raw:{raw_states}")
+        # Apply per-button invert
+        back = raw_states.get("back", False)
+        confirm = raw_states.get("confirm", False)
+        push = raw_states.get("push", False)
+        if BACK_INVERT:
+            back = not back
+        if CONFIRM_INVERT:
+            confirm = not confirm
+        if PUSH_INVERT:
+            push = not push
+        # Optionally treat push as confirm
+        if USE_PUSH_AS_CONFIRM:
+            confirm = confirm or push
         now = time.monotonic()
-        for name in ("back", "confirm"):
-            pressed = states.get(name, False)
+        for name, pressed in ("back", back), ("confirm", confirm):
             last_pressed = self._btn_state[name]
             if pressed != last_pressed:
                 last_change = self._btn_last_change[name]
@@ -311,7 +337,6 @@ class App:
                     self._btn_last_change[name] = now
                     self._btn_state[name] = pressed
                     if pressed:
-                        # rising edge only
                         self._handle_button(name)
         # Exit on hold Back+Confirm
         if self._btn_state["back"] and self._btn_state["confirm"]:
