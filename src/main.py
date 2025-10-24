@@ -1,15 +1,36 @@
 import threading
 import time
+import os
 from queue import Queue
 from typing import Callable, List, Optional
 
 from gpiozero import Button, RotaryEncoder
+try:
+    from gpiozero.pins.rpigpio import RPiGPIOFactory  # Prefer RPi.GPIO to avoid lgpio busy
+    DEFAULT_PIN_FACTORY = RPiGPIOFactory()
+except Exception:
+    DEFAULT_PIN_FACTORY = None
 
 from src.core.events import Button as ButtonEvent, Rotate, Tick, TaskDone, Event
 from src.core.docker_actions import DockerManager
 from src.core import system_actions
 from src.games.snake import SnakeGame
 from src.hw.display import OledDisplay
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        return int(v) if v is not None and v != "" else default
+    except Exception:
+        return default
+
+
+BACK_GPIO = _env_int("BESSAM_BACK_GPIO", 17)
+CONFIRM_GPIO = _env_int("BESSAM_CONFIRM_GPIO", 5)
+PUSH_GPIO = _env_int("BESSAM_PUSH_GPIO", 10)
+ENC_A_GPIO = _env_int("BESSAM_ENC_A_GPIO", 22)
+ENC_B_GPIO = _env_int("BESSAM_ENC_B_GPIO", 27)
 
 
 class BackgroundWorker:
@@ -40,10 +61,17 @@ class App:
         self.docker = DockerManager()
         self.worker = BackgroundWorker(self.events)
         # GPIO setup
-        self.btn_back = Button(17, pull_up=True, bounce_time=0.1)
-        self.btn_confirm = Button(5, pull_up=True, bounce_time=0.1)
-        self.btn_push = Button(10, pull_up=True, bounce_time=0.1)
-        self.encoder = RotaryEncoder(22, 27, bounce_time=0.002)
+        pin_factory = DEFAULT_PIN_FACTORY
+        try:
+            self.btn_back = Button(BACK_GPIO, pull_up=True, bounce_time=0.1, pin_factory=pin_factory)
+            self.btn_confirm = Button(CONFIRM_GPIO, pull_up=True, bounce_time=0.1, pin_factory=pin_factory)
+            self.btn_push = Button(PUSH_GPIO, pull_up=True, bounce_time=0.1, pin_factory=pin_factory)
+            self.encoder = RotaryEncoder(ENC_A_GPIO, ENC_B_GPIO, bounce_time=0.002, pin_factory=pin_factory)
+        except Exception as e:
+            # Show a helpful message then propagate
+            self.display.draw_text(f"GPIO error:\n{str(e)[:20]}\nSet BESSAM_*_GPIO\nor change pin factory")
+            time.sleep(2.0)
+            raise
         self._last_steps = self.encoder.steps
         # Register input callbacks -> queue events only
         self.btn_back.when_pressed = lambda: self.events.put(ButtonEvent(type="button", name="back"))
@@ -207,13 +235,11 @@ class App:
             if not self.game:
                 return
             if name == "confirm":
-                # Pause toggle could be implemented; keep simple
                 pass
             elif name == "back":
                 self._show_menu()
                 self.game = None
         elif self.mode == "progress":
-            # ignore buttons during progress
             pass
 
     def _handle_rotate(self, delta: int) -> None:
@@ -233,13 +259,11 @@ class App:
             self._render_game()
 
     def _handle_tick(self) -> None:
-        # Poll encoder steps -> convert to rotate events
         steps = self.encoder.steps
         if steps != self._last_steps:
             delta = 1 if steps > self._last_steps else -1
             self._last_steps = steps
             self._handle_rotate(delta)
-        # Periodic UI updates
         if self.mode == "progress":
             self.spinner_frame = (self.spinner_frame + 1) % 12
             self.display.draw_spinner(self._progress_message, self.spinner_frame)
@@ -256,7 +280,6 @@ class App:
                 except Exception:
                     event = Tick(type="tick")
                 if isinstance(event, ButtonEvent):
-                    # Support hold Back+Confirm to exit
                     if event.name in ("back", "confirm"):
                         now = time.monotonic()
                         if self.btn_back.is_pressed and self.btn_confirm.is_pressed:
