@@ -29,9 +29,10 @@ pip install -r requirements.txt
 Enable I2C in raspi-config and reboot.
 
 ## Run
+Run from the project root so package imports resolve:
 ```bash
 source .venv/bin/activate
-python3 -u src/main.py
+python3 -u -m src.main
 ```
 
 ## Optional: systemd service
@@ -44,7 +45,7 @@ After=network.target docker.service
 [Service]
 User=pi
 WorkingDirectory=/home/pi/bessam_os
-ExecStart=/home/pi/bessam_os/.venv/bin/python -u src/main.py
+ExecStart=/home/pi/bessam_os/.venv/bin/python -u -m src.main
 Restart=always
 RestartSec=2
 
