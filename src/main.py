@@ -5,17 +5,24 @@ from queue import Queue
 from typing import Callable, List, Optional
 
 from gpiozero import Button, RotaryEncoder
-try:
-    from gpiozero.pins.rpigpio import RPiGPIOFactory  # Prefer RPi.GPIO to avoid lgpio busy
-    DEFAULT_PIN_FACTORY = RPiGPIOFactory()
-except Exception:
-    DEFAULT_PIN_FACTORY = None
-
 from src.core.events import Button as ButtonEvent, Rotate, Tick, TaskDone, Event
 from src.core.docker_actions import DockerManager
 from src.core import system_actions
 from src.games.snake import SnakeGame
 from src.hw.display import OledDisplay
+
+try:
+    from gpiozero.pins.rpigpio import RPiGPIOFactory  # Prefer RPi.GPIO
+except Exception:
+    RPiGPIOFactory = None  # type: ignore
+try:
+    from gpiozero.pins.lgpio import LGPIOFactory
+except Exception:
+    LGPIOFactory = None  # type: ignore
+try:
+    from gpiozero.pins.pigpio import PiGPIOFactory
+except Exception:
+    PiGPIOFactory = None  # type: ignore
 
 
 def _env_int(name: str, default: int) -> int:
@@ -60,23 +67,8 @@ class App:
         self.display = OledDisplay()
         self.docker = DockerManager()
         self.worker = BackgroundWorker(self.events)
-        # GPIO setup
-        pin_factory = DEFAULT_PIN_FACTORY
-        try:
-            self.btn_back = Button(BACK_GPIO, pull_up=True, bounce_time=0.1, pin_factory=pin_factory)
-            self.btn_confirm = Button(CONFIRM_GPIO, pull_up=True, bounce_time=0.1, pin_factory=pin_factory)
-            self.btn_push = Button(PUSH_GPIO, pull_up=True, bounce_time=0.1, pin_factory=pin_factory)
-            self.encoder = RotaryEncoder(ENC_A_GPIO, ENC_B_GPIO, bounce_time=0.002, pin_factory=pin_factory)
-        except Exception as e:
-            # Show a helpful message then propagate
-            self.display.draw_text(f"GPIO error:\n{str(e)[:20]}\nSet BESSAM_*_GPIO\nor change pin factory")
-            time.sleep(2.0)
-            raise
+        self._init_gpio()
         self._last_steps = self.encoder.steps
-        # Register input callbacks -> queue events only
-        self.btn_back.when_pressed = lambda: self.events.put(ButtonEvent(type="button", name="back"))
-        self.btn_confirm.when_pressed = lambda: self.events.put(ButtonEvent(type="button", name="confirm"))
-        self.btn_push.when_pressed = lambda: self.events.put(ButtonEvent(type="button", name="push"))
         # State
         self.mode: str = "menu"  # menu | progress | game_snake | docker_list | docker_container
         self.spinner_frame = 0
@@ -85,11 +77,68 @@ class App:
         self.current_index = 0
         self.current_container_id: Optional[str] = None
         self.game: Optional[SnakeGame] = None
+        # Button polling state
+        self._btn_state = {"back": False, "confirm": False, "push": False}
         # Init UI
         self._init_menus()
         self.display.draw_text("Pi Control\nSystem v2.0\n\nInitializing...")
         time.sleep(1.0)
         self._show_menu()
+
+    def _candidate_factories(self) -> List:
+        order = []
+        env = os.getenv("GPIOZERO_PIN_FACTORY", "").strip().lower()
+        mapping = {
+            "rpigpio": RPiGPIOFactory,
+            "lgpio": LGPIOFactory,
+            "pigpio": PiGPIOFactory,
+        }
+        if env in mapping and mapping[env] is not None:
+            order.append(mapping[env])
+        # Default preference order
+        for f in (RPiGPIOFactory, LGPIOFactory, PiGPIOFactory):
+            if f is not None and f not in order:
+                order.append(f)
+        return order
+
+    def _init_gpio(self) -> None:
+        last_error: Optional[Exception] = None
+        for Factory in self._candidate_factories():
+            try:
+                pf = Factory()  # type: ignore[call-arg]
+                btn_back = Button(BACK_GPIO, pull_up=True, bounce_time=0.1, pin_factory=pf)
+                btn_confirm = Button(CONFIRM_GPIO, pull_up=True, bounce_time=0.1, pin_factory=pf)
+                btn_push = Button(PUSH_GPIO, pull_up=True, bounce_time=0.1, pin_factory=pf)
+                encoder = RotaryEncoder(ENC_A_GPIO, ENC_B_GPIO, bounce_time=0.002, pin_factory=pf)
+                # Assign only if all succeed
+                self.pin_factory = pf  # type: ignore[attr-defined]
+                self.btn_back = btn_back
+                self.btn_confirm = btn_confirm
+                self.btn_push = btn_push
+                self.encoder = encoder
+                return
+            except Exception as e:
+                last_error = e
+                try:
+                    btn_back.close()  # type: ignore[name-defined]
+                except Exception:
+                    pass
+                try:
+                    btn_confirm.close()  # type: ignore[name-defined]
+                except Exception:
+                    pass
+                try:
+                    btn_push.close()  # type: ignore[name-defined]
+                except Exception:
+                    pass
+                try:
+                    encoder.close()  # type: ignore[name-defined]
+                except Exception:
+                    pass
+                continue
+        self.display.draw_text(f"GPIO init failed:\n{str(last_error)[:22]}\nTry GPIOZERO_PIN_FACTORY=lgpio\nor pigpio (sudo pigpiod)")
+        time.sleep(2.0)
+        raise last_error if last_error else RuntimeError("GPIO init failed")
 
     def _init_menus(self) -> None:
         def push_menu(title: str, items: List[tuple[str, Callable[[], None]]]) -> None:
@@ -258,12 +307,44 @@ class App:
             self.game.change_direction_clockwise(clockwise=(delta > 0))
             self._render_game()
 
+    def _poll_buttons(self) -> None:
+        back = bool(self.btn_back.is_pressed)
+        confirm = bool(self.btn_confirm.is_pressed)
+        push = bool(self.btn_push.is_pressed)
+        now = time.monotonic()
+        # Exit on hold Back+Confirm
+        if back and confirm:
+            hold = getattr(self, "_hold_start", None)
+            if hold is None:
+                self._hold_start = now
+            elif now - hold > 2.0:
+                self.display.draw_text("Exiting...")
+                time.sleep(0.5)
+                self.display.clear()
+                raise SystemExit(0)
+        else:
+            self._hold_start = None  # type: ignore[assignment]
+        # Rising edges
+        if back and not self._btn_state["back"]:
+            self._handle_button("back")
+        if confirm and not self._btn_state["confirm"]:
+            self._handle_button("confirm")
+        if push and not self._btn_state["push"]:
+            self._handle_button("push")
+        self._btn_state["back"] = back
+        self._btn_state["confirm"] = confirm
+        self._btn_state["push"] = push
+
     def _handle_tick(self) -> None:
+        # Poll encoder steps
         steps = self.encoder.steps
         if steps != self._last_steps:
             delta = 1 if steps > self._last_steps else -1
             self._last_steps = steps
             self._handle_rotate(delta)
+        # Poll buttons
+        self._poll_buttons()
+        # Periodic UI
         if self.mode == "progress":
             self.spinner_frame = (self.spinner_frame + 1) % 12
             self.display.draw_spinner(self._progress_message, self.spinner_frame)
@@ -272,7 +353,6 @@ class App:
             self._render_game()
 
     def run(self) -> None:
-        hold_start: Optional[float] = None
         while True:
             try:
                 try:
@@ -280,18 +360,6 @@ class App:
                 except Exception:
                     event = Tick(type="tick")
                 if isinstance(event, ButtonEvent):
-                    if event.name in ("back", "confirm"):
-                        now = time.monotonic()
-                        if self.btn_back.is_pressed and self.btn_confirm.is_pressed:
-                            if hold_start is None:
-                                hold_start = now
-                            elif now - hold_start > 2.0:
-                                self.display.draw_text("Exiting...")
-                                time.sleep(0.5)
-                                self.display.clear()
-                                return
-                        else:
-                            hold_start = None
                     self._handle_button(event.name)
                 elif isinstance(event, Rotate):
                     self._handle_rotate(event.delta)
