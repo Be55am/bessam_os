@@ -1,0 +1,7 @@
+adafruit-circuitpython-ssd1306>=2.12.12
+Pillow>=10.0.0
+gpiozero>=1.6.2
+RPi.GPIO>=0.7.1
+smbus2>=0.5.1
+Adafruit-Blinka>=8.34.0
+docker>=7.0.0
