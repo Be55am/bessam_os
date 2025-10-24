@@ -5,3 +5,4 @@ RPi.GPIO>=0.7.1
 smbus2==0.5.0
 Adafruit-Blinka>=8.34.0
 docker>=7.0.0
+evdev>=1.7.1

@@ -6,6 +6,11 @@ try:
 except Exception as e:  # pragma: no cover
     raise RuntimeError(f"RPi.GPIO not available: {e}")
 
+try:
+    from src.hw.evdev_keys import EvdevConfirm
+except Exception:
+    EvdevConfirm = None  # type: ignore
+
 
 class Inputs:
     def __init__(self, back_gpio: int, confirm_gpio: int, push_gpio: int, pull_up: bool = True) -> None:
@@ -19,6 +24,7 @@ class Inputs:
         }
         for pin in self._pins.values():
             GPIO.setup(pin, GPIO.IN, pull_up_down=pud)
+        self._evdev = EvdevConfirm() if EvdevConfirm is not None else None
         atexit.register(self.close)
 
     def read_states(self) -> Dict[str, bool]:
@@ -27,9 +33,20 @@ class Inputs:
             val = GPIO.input(pin)
             pressed = (val == GPIO.LOW) if self._pull_up else (val == GPIO.HIGH)
             states[name] = pressed
+        # Fallback: if evdev gpio-keys present, OR it into confirm
+        try:
+            if self._evdev is not None and self._evdev.available and self._evdev.is_pressed():
+                states["confirm"] = True
+        except Exception:
+            pass
         return states
 
     def close(self) -> None:
+        try:
+            if self._evdev is not None:
+                self._evdev.close()
+        except Exception:
+            pass
         try:
             GPIO.cleanup()
         except Exception:
