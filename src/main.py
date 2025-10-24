@@ -4,26 +4,12 @@ import os
 from queue import Queue
 from typing import Callable, List, Optional
 
-from gpiozero import RotaryEncoder
 from src.core.events import Button as ButtonEvent, Rotate, Tick, TaskDone, Event
 from src.core.docker_actions import DockerManager
 from src.core import system_actions
 from src.games.snake import SnakeGame
 from src.hw.display import OledDisplay
-from src.hw.input import Inputs
-
-try:
-    from gpiozero.pins.rpigpio import RPiGPIOFactory  # Prefer RPi.GPIO for encoder
-except Exception:
-    RPiGPIOFactory = None  # type: ignore
-try:
-    from gpiozero.pins.lgpio import LGPIOFactory
-except Exception:
-    LGPIOFactory = None  # type: ignore
-try:
-    from gpiozero.pins.pigpio import PiGPIOFactory
-except Exception:
-    PiGPIOFactory = None  # type: ignore
+from src.hw.input import Inputs, EncoderPoller
 
 
 def _env_int(name: str, default: int) -> int:
@@ -69,8 +55,8 @@ class App:
         self.docker = DockerManager()
         self.worker = BackgroundWorker(self.events)
         self.inputs = Inputs(BACK_GPIO, CONFIRM_GPIO, PUSH_GPIO, pull_up=True)
-        self._init_encoder()
-        self._last_steps = self.encoder.steps
+        self.encoder = EncoderPoller(ENC_A_GPIO, ENC_B_GPIO, pull_up=True, ticks_per_detent=2)
+        self._last_steps = 0
         # State
         self.mode: str = "menu"
         self.spinner_frame = 0
@@ -86,41 +72,6 @@ class App:
         self.display.draw_text("Pi Control\nSystem v2.0\n\nInitializing...")
         time.sleep(1.0)
         self._show_menu()
-
-    def _candidate_factories(self) -> List:
-        order = []
-        env = os.getenv("GPIOZERO_PIN_FACTORY", "").strip().lower()
-        mapping = {
-            "rpigpio": RPiGPIOFactory,
-            "lgpio": LGPIOFactory,
-            "pigpio": PiGPIOFactory,
-        }
-        if env in mapping and mapping[env] is not None:
-            order.append(mapping[env])
-        for f in (RPiGPIOFactory, LGPIOFactory, PiGPIOFactory):
-            if f is not None and f not in order:
-                order.append(f)
-        return order
-
-    def _init_encoder(self) -> None:
-        last_error: Optional[Exception] = None
-        for Factory in self._candidate_factories():
-            try:
-                pf = Factory()  # type: ignore[call-arg]
-                encoder = RotaryEncoder(ENC_A_GPIO, ENC_B_GPIO, bounce_time=0.002, pin_factory=pf)
-                self.pin_factory = pf  # type: ignore[attr-defined]
-                self.encoder = encoder
-                return
-            except Exception as e:
-                last_error = e
-                try:
-                    encoder.close()  # type: ignore[name-defined]
-                except Exception:
-                    pass
-                continue
-        self.display.draw_text(f"Encoder init failed:\n{str(last_error)[:22]}")
-        time.sleep(2.0)
-        raise last_error if last_error else RuntimeError("Encoder init failed")
 
     def _init_menus(self) -> None:
         def push_menu(title: str, items: List[tuple[str, Callable[[], None]]]) -> None:
@@ -317,10 +268,8 @@ class App:
         self._btn_state["push"] = push
 
     def _handle_tick(self) -> None:
-        steps = self.encoder.steps
-        if steps != self._last_steps:
-            delta = 1 if steps > self._last_steps else -1
-            self._last_steps = steps
+        delta = self.encoder.read_delta()
+        if delta:
             self._handle_rotate(delta)
         self._poll_buttons()
         if self.mode == "progress":
